@@ -1,4 +1,5 @@
 /*
+FAT32 parser
 
 reference:
 FAT: https://wiki.osdev.org/FAT#Implementation_Details
@@ -14,7 +15,8 @@ Flexible Array Member: https://en.wikipedia.org/wiki/Flexible_array_member
 #include <stdint.h>
 #include <stdbool.h>
 #include <stdlib.h>
-
+#include <uchar.h>
+#include <locale.h>
 
 
 /*
@@ -46,11 +48,12 @@ typedef struct {
 } ClusterChain;
     
 typedef struct {
-    char file_name[32];
+    char file_name[512];
     uint8_t attr;
     uint8_t creation_time;
     int cluster_num;
     int file_size;
+    int size;
     ClusterChain* cluster_chain;
 } DirEntry;
 
@@ -70,9 +73,14 @@ typedef struct {
 static uint8_t* file_begin;
 static uint8_t* fat_offset;
 static uint8_t* dir_offset;
-// bpb contain fs meta data, should be easily access by any function
+// bpb contain fs meta data, fat is index of data
+// should be easily access by any function
 static BPB bpb;
+static FAT* fat;
 
+
+#define LFN_END_MASK 0x40
+#define LFN_NUM_MASK 0x17
 
 // root entry's cluster_num is 2
 #define DATA_OFFSET(cluster_num) \
@@ -123,9 +131,20 @@ bool entry_end(uint8_t* buffer)
     return buffer[0] == 0;
 }
 
-int min(int a, int b)
+void utf16_to_utf8(char16_t str[], char res[], int len)
 {
-    return a > b ? b : a;
+    mbstate_t ps;
+    memset(&ps, 0, sizeof(ps));
+
+    // char res[100] = {0};
+    char* offset = &res[0];
+    for (int i = 0; i < len; i++) 
+    {
+        char buf[4] = {0};
+        c16rtomb(buf, str[i], &ps);
+        memcpy(offset, buf, strlen(buf));
+        offset += strlen(buf);
+    }
 }
 
 
@@ -158,7 +177,7 @@ BPB parse_bpb(uint8_t* buffer)
     return bpb;
 }
 
-ClusterChain* parse_cluster_chain(int cluster_num, FAT* fat)
+ClusterChain* parse_cluster_chain(int cluster_num)
 {
     int v = fat->cluster_info[cluster_num];
     // v >= 0x0ffffff8: cluster end
@@ -180,15 +199,107 @@ ClusterChain* parse_cluster_chain(int cluster_num, FAT* fat)
     return c;
 }
 
-DirEntry parse_dir_entry(uint8_t* buffer, FAT* fat)
+void parse_lfn(uint8_t* buffer, DirEntry* entry)
 {
-    // ignore long file name for now
-    buffer += 32;
+    char file_name[512] = {0};
+    uint8_t b = buffer[0];
+    uint8_t lfn_num = b & LFN_NUM_MASK;
 
-    DirEntry entry;
-    memcpy(entry.file_name, buffer, 11);
-    buffer += 11;
+    int len = 1;
+    uint8_t* lfn_chain[20];
+    lfn_chain[0] = buffer;
+    while (lfn_num > 1)
+    {
+        buffer += 32;
+        lfn_num = buffer[0] & LFN_NUM_MASK;
+        // printf("lfn_num: %d\n", lfn_num);
+        lfn_chain[len] = buffer;
+        len += 1;
+    }
+    
+    for (int i = len - 1; i >= 0; i--)
+    {
+        char16_t name[13] = {0};
+        int j = 0;
+        uint8_t* lfn_offset = lfn_chain[i];
+        lfn_offset += 1;
+        for (int i = 0; i < 5; i++)
+        {
+            if (lfn_offset[0] == 0xff)
+            {
+                lfn_offset += 2;
+                continue;
+            }
+            name[j] = little_endian_to_int(lfn_offset, 2);
+            lfn_offset += 2;
+            j += 1;
+        }
+        // skip attr, long entry type, chekcusm
+        lfn_offset += 3;
+        for (int i = 0; i < 6; i++)
+        {
+            if (lfn_offset[0] == 0xff)
+            {
+                lfn_offset += 2;
+                continue;
+            }
+            name[j] = little_endian_to_int(lfn_offset, 2);
+            lfn_offset += 2;
+            j += 1;
+        }
+        // always zero
+        lfn_offset += 2;
+        for (int i = 0; i < 2; i++)
+        {
+            if (lfn_offset[0] == 0xff)
+            {
+                lfn_offset += 2;
+                continue;
+            }
+            name[j] = little_endian_to_int(lfn_offset, 2);
+            lfn_offset += 2;
+            j += 1;
+        }
 
+        char res[14] = {0};
+        utf16_to_utf8(name, res, j);
+        strcat(file_name, res);
+    }
+    memcpy(entry->file_name, file_name, strlen(file_name));
+    entry->size = (len + 1) * 32;
+}
+
+DirEntry parse_dir_entry(uint8_t* buffer)
+{
+    DirEntry entry = {
+        .file_name = {0}
+    };
+    
+    uint8_t attr = buffer[11];
+    if (attr == 0x0f)
+    {
+        parse_lfn(buffer, &entry);
+        buffer += entry.size - 32;
+        // since there is lfn, standard8.3 file name can be ignored
+        buffer += 11;
+    }
+    else
+    {
+        // standard8.3, parse file name
+        int j = 0;
+        for (int i = 0; i < 11; i++)
+        {
+            uint8_t c = buffer[0];
+            // ignore spaces
+            if (c != 0x20)
+            {
+                entry.file_name[j] = c;
+                j += 1;
+            }
+            buffer += 1;
+        }    
+    }
+    
     entry.attr = buffer[0];
     // ignore create time for now
     buffer += 9;
@@ -202,29 +313,32 @@ DirEntry parse_dir_entry(uint8_t* buffer, FAT* fat)
     int cluster_num = (high << 16) + low;
     entry.cluster_num = cluster_num;
     
-    entry.cluster_chain = parse_cluster_chain(cluster_num, fat);
+    entry.cluster_chain = parse_cluster_chain(cluster_num);
     
     entry.file_size = little_endian_to_int(buffer, 4);
     buffer += 4;
     return entry;
 }
 
-DirEntryList* parse_dir_entries(uint8_t* buffer, FAT* fat, DirEntry parent)
+DirEntryList* parse_dir_entries(uint8_t* buffer, DirEntry parent)
 {
     // flexible array member
     DirEntryList* es = malloc(sizeof(DirEntryList) + 100 * sizeof(DirEntry));
     int left_cluster = parent.cluster_chain->size;
     int i = 0;
+    int parsed_bytes = 0;
     while (!entry_end(buffer))
     {
-        DirEntry entry = parse_dir_entry(buffer, fat);
+        DirEntry entry = parse_dir_entry(buffer);
         showDirEntry(entry);
-        buffer += 64;
+        buffer += entry.size;
+        parsed_bytes += entry.size;
+        
         es->entries[es->size] = entry;
         es->size += 1;
 
-        // 512 / 64 = 8, so one cluster can contain 8 entries
-        if (es->size % 8 == 0 && left_cluster > 0)
+        // if reach cluster end, jump to next cluster
+        if (parsed_bytes % bpb.num_of_bytes_per_sector == 0 && left_cluster > 0)
         {
             // buffer jump to new cluster
             int n = parent.cluster_chain->cluster[i];
@@ -236,20 +350,21 @@ DirEntryList* parse_dir_entries(uint8_t* buffer, FAT* fat, DirEntry parent)
     return es;
 }
 
-// pass entry directly?
-void show_dir_entry(DirEntryList* es, FAT* fat)
+void walk_fs(DirEntry entry)
 {
-    // DirEntryList* es =  parse_dir_entries(offset2);
+    uint8_t* offset = dir_offset + DATA_OFFSET(entry.cluster_num);
+    DirEntryList* es =  parse_dir_entries(offset, entry);
     for (int i = 0; i < es->size; i++)
     {
         DirEntry e = es->entries[i];
         if (IS_DIR(e))
         {
+            if (strcmp(e.file_name, ".") == 0 || strcmp(e.file_name, "..") == 0)
+            {
+                continue;
+            }
             // printf("[folder_data_offset] %x %d\n", (int)dir_offset + DATA_OFFSET(e, bpb), e.cluster_num);
-            uint8_t* offset = dir_offset + DATA_OFFSET(e.cluster_num);
-            // jump over . and .. entry
-            offset += 64;
-            show_dir_entry(parse_dir_entries(offset, fat, e), fat);
+            walk_fs(e);
         }
         else
         {
@@ -297,11 +412,14 @@ FAT* parse_fat(uint8_t* buffer)
 
 int main()
 {
+    setlocale(LC_ALL, "en_US.UTF-8");
+    
     // printf("hello fs\n");
-    int fd = open("disk.img", O_RDWR);
+    int fd = open("disk6.img", O_RDWR);
     if (fd == -1)
     {
         printf("open failed! %s\n", strerror(errno));
+        return -1;
     }
 
     const int size = 1024 * 1000 * 1000;
@@ -310,6 +428,7 @@ int main()
     if (res == -1)
     {
         printf("read failed! %s\n", strerror(errno));
+        return -1;
     }
     
     bpb = parse_bpb(file_begin);
@@ -317,7 +436,7 @@ int main()
     int i = bpb.num_of_reserved_sectors * bpb.num_of_bytes_per_sector;
     fat_offset = &file_begin[i];
     printf("fat_offset: %x\n", i);
-    FAT* fat = parse_fat(fat_offset);
+    fat = parse_fat(fat_offset);
     printf("fat_size: %d\n", fat->size);
 
     // jump to directory entry
@@ -327,11 +446,9 @@ int main()
 
     DirEntry root;
     root.cluster_num = 2;
-    root.cluster_chain = parse_cluster_chain(root.cluster_num, fat);
+    root.cluster_chain = parse_cluster_chain(root.cluster_num);
     showDirEntry(root);
-    DirEntryList* es =  parse_dir_entries(dir_offset, fat, root);
-    show_dir_entry(es, fat);
-    
+    walk_fs(root);
 
     // write file content
     // char data2[] = "123456789";
