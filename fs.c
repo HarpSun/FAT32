@@ -23,42 +23,70 @@ Flexible Array Member: https://en.wikipedia.org/wiki/Flexible_array_member
 FAT structure
 */
 // BIOS Parameter Block
-typedef struct {
+typedef struct __attribute__((packed)) {
     uint8_t boot_cmd[3];
     uint8_t oem_identifier[8];
-    int num_of_bytes_per_sector;
-    int num_of_bytes_per_cluster;
-    int num_of_sectors_per_cluster;
-    int num_of_reserved_sectors;
-    int num_of_fat;
-    int num_of_root_dir_entries;
-    int total_sectors;
+    uint16_t num_of_bytes_per_sector;
+    uint8_t num_of_sectors_per_cluster;
+    uint16_t num_of_reserved_sectors;
+    uint8_t num_of_fat;
+    uint16_t num_of_root_dir_entries;
+    uint16_t total_sectors;
     uint8_t media_descriptor_type;
-    int num_of_sectors_per_fat;  // FAT12/FAT16 only
-    int num_of_sectors_per_track;
-    int num_of_heads;
-    int num_of_hidden_sectors;
-    int large_sectors_count;
-    int sectors_per_fat;
+    uint16_t num_of_sectors_per_fat;  // FAT12/FAT16 only
+    uint16_t num_of_sectors_per_track;
+    uint16_t num_of_heads;
+    uint32_t num_of_hidden_sectors;
+    uint32_t large_sectors_count;
 } BPB;
-    
-typedef struct {
-    char file_name[512];
+
+typedef struct __attribute__((packed)) {
+    uint32_t sectors_per_fat;
+} ExtendBootRecord;
+
+typedef struct __attribute__((packed)) {
+    uint8_t order;
+    uint8_t name1[10];
     uint8_t attr;
-    uint8_t creation_time;
-    int cluster_num;
-    int file_size;
-    int size;
+    uint8_t long_entry_type;
+    uint8_t checksum;
+    uint8_t name2[12];
+    uint16_t zero;
+    uint8_t name3[4];
+} LFN;
+
+// standard 8.3 format
+typedef struct __attribute__((packed)) {
+    uint8_t file_name[11];
+    uint8_t attr;
+    uint8_t reserved;
+    uint8_t creation_time_millisecond;
+    uint16_t created_time;
+    uint16_t created_date;
+    uint16_t last_accessed_date;
+    uint16_t high_cluster_num;
+    uint16_t last_modify_time;
+    uint16_t last_modify_date;
+    uint16_t low_cluster_num;
+    uint32_t file_size;
 } DirEntry;
 
 typedef struct {
+    char file_name[512];
+    int cluster_num;
+    int file_size;
     int size;
-    DirEntry entries[];
+    uint8_t attr;
+} MyDirEntry;
+
+typedef struct {
+    int size;
+    MyDirEntry entries[];
 } DirEntryList;
 
 typedef struct {
     int size;
-    int cluster_info[];
+    uint32_t cluster_info[];
 } FAT;
 
 
@@ -70,6 +98,7 @@ static uint8_t* dir_offset;
 // bpb contain fs meta data, fat is index of data
 // should be easily access by any function
 static BPB bpb;
+static ExtendBootRecord ebr;
 static FAT* fat;
 
 
@@ -96,10 +125,9 @@ void showBPB(BPB bpb)
     printf("num_of_sectors_per_cluster: %d\n", bpb.num_of_sectors_per_cluster);
     printf("num_of_reserved_sectors: %d\n", bpb.num_of_reserved_sectors);
     printf("num_of_fat: %d\n", bpb.num_of_fat);
-    printf("sectors_per_fat: %d\n", bpb.sectors_per_fat);
 }
 
-void showDirEntry(DirEntry entry)
+void showDirEntry(MyDirEntry entry)
 {
     printf("--------------- DirEntry ---------------\n");
     printf("file_name: %s\n", entry.file_name);
@@ -112,54 +140,47 @@ void showDirEntry(DirEntry entry)
 //
 //                utils
 //
-int little_endian_to_int(uint8_t* bytes, size_t len)
-{
-    int res = 0;
-    for (int i = 0; i < len; i++)
-    {
-        res += bytes[i] << (i * 8);
-    }
-    return res;
-}
-
 bool entry_end(uint8_t* buffer)
 {
     return buffer[0] == 0;
 }
 
-void utf16_to_utf8(char16_t str[], char res[], size_t len)
+void utf16_to_utf8(char16_t* str, char* res)
 {
     mbstate_t ps;
     memset(&ps, 0, sizeof(ps));
 
-    // char res[100] = {0};
     char* offset = &res[0];
-    for (int i = 0; i < len; i++) 
+    int i = 0;
+    char16_t c;
+    while (c = str[i], c != 0)
     {
         char buf[4] = {0};
-        c16rtomb(buf, str[i], &ps);
+        c16rtomb(buf, c, &ps);
         memcpy(offset, buf, strlen(buf));
         offset += strlen(buf);
+        i++;
     }
 }
 
 // auto jump to next cluster, if step would across current cluster
 int step_buffer(uint8_t** buffer, size_t n)
 {
-    int pos = (*buffer - dir_offset) % bpb.num_of_bytes_per_cluster;
-    if (pos + n < 512)
+    int bytes_per_cluster = bpb.num_of_bytes_per_sector * bpb.num_of_sectors_per_cluster;
+    int pos = (*buffer - dir_offset) % bytes_per_cluster;
+    if (pos + n < bytes_per_cluster)
     {
         *buffer += n;
         return 0;
     }
     else
     {
-        int cluster_num = (*buffer - dir_offset) / bpb.num_of_bytes_per_cluster + 2;
+        int cluster_num = (*buffer - dir_offset) / bytes_per_cluster + 2;
         int v = fat->cluster_info[cluster_num];
         if (v < CLUSTER_END && v != CLUSTER_BAD)
         {
             *buffer = DATA_OFFSET(v);
-            *buffer += n - (bpb.num_of_bytes_per_cluster - pos);
+            *buffer += n - (bytes_per_cluster - pos);
             return 0;
         }
         else
@@ -177,162 +198,82 @@ int step_buffer(uint8_t** buffer, size_t n)
 BPB parse_bpb(uint8_t* buffer)
 {
     BPB bpb;
-
-    memcpy(bpb.boot_cmd, buffer, 3);
-    buffer += 3;
-    
-    memcpy(bpb.oem_identifier, buffer, 8);
-    buffer += 8;
-
-    bpb.num_of_bytes_per_sector = little_endian_to_int(buffer, 2);
-    buffer += 2;
-
-    bpb.num_of_sectors_per_cluster = buffer[0];
-    buffer += 1;
-
-    bpb.num_of_reserved_sectors = little_endian_to_int(buffer, 2);
-    buffer += 2;
-
-    bpb.num_of_fat = buffer[0];
-    buffer += 1;
-
-    buffer += 19;
-    bpb.sectors_per_fat = little_endian_to_int(buffer, 4);
-    bpb.num_of_bytes_per_cluster = bpb.num_of_bytes_per_sector * bpb.num_of_sectors_per_cluster;
-    
+    memcpy(&bpb, buffer, sizeof(bpb));
     showBPB(bpb);
     return bpb;
 }
 
-void parse_lfn(uint8_t* buffer, char res[])
+ExtendBootRecord parse_extend_boot_record(uint8_t* buffer)
 {
-    // skip order byte
-    buffer += 1;
-    
-    char16_t name[13] = {0};
-    int j = 0;
-    for (int i = 0; i < 5; i++)
-    {
-        if (buffer[0] != 0xff)
-        {
-            name[j] = little_endian_to_int(buffer, 2);
-            j += 1;
-        }
-        buffer += 2;
-    }
-    // skip attr, long entry type, chekcusm
-    buffer += 3;
-    
-    for (int i = 0; i < 6; i++)
-    {
-        if (buffer[0] != 0xff)
-        {
-            name[j] = little_endian_to_int(buffer, 2);
-            j += 1;
-        }
-        buffer += 2;
-    }
-    // always zero
-    buffer += 2;
-    
-    for (int i = 0; i < 2; i++)
-    {
-        if (buffer[0] != 0xff)
-        {
-            name[j] = little_endian_to_int(buffer, 2);
-            j += 1;
-        }
-        buffer += 2;
-    }
-
-    utf16_to_utf8(name, res, j);
+    ExtendBootRecord ebr;
+    memcpy(&ebr, buffer, sizeof(ebr));
+    return ebr;
 }
 
-void parse_lfns(uint8_t* buffer, DirEntry* entry)
+void parse_lfn(uint8_t* buffer, MyDirEntry* entry)
 {
-    char file_name[512] = {0};
-    uint8_t b = buffer[0];
-    uint8_t lfn_num = b & LFN_NUM_MASK;
-
-    // lfn is stored in reverse order, make it hard to concat it together
-    // by store all lfn location in a chian, we can easily parse and concat it from start
-    int len = 1;
-    uint8_t* lfn_chain[20];
-    lfn_chain[0] = buffer;
-    while (lfn_num > 1)
-    {
-        buffer += 32;
-        lfn_num = buffer[0] & LFN_NUM_MASK;
-        // printf("lfn_num: %d\n", lfn_num);
-        lfn_chain[len] = buffer;
+    LFN lfn_array[20];
+    int len = 0;
+    
+    uint8_t lfn_number;
+    do {
+        LFN lfn;
+        memcpy(&lfn, buffer, sizeof(lfn));
+        lfn_number = lfn.order & LFN_NUM_MASK;
+        lfn_array[lfn_number - 1] = lfn;
         len += 1;
+        buffer += 32;
+    } while (lfn_number > 1);
+
+    char16_t utf16_name[256];
+    char16_t* offset = &utf16_name[0];
+    for (int i = 0; i < len; i++)
+    {
+        LFN lfn = lfn_array[i];
+        memcpy(offset, lfn.name1, 10);
+        offset += 5;
+        memcpy(offset, lfn.name2, 12);
+        offset += 6;
+        memcpy(offset, lfn.name3, 4);
+        offset += 2;
     }
     
-    for (int i = len - 1; i >= 0; i--)
-    {
-        char res[14] = {0};
-        parse_lfn(lfn_chain[i], res); 
-        strcat(file_name, res);
-    }
-    memcpy(entry->file_name, file_name, strlen(file_name));
+    char utf8_name[512] = {0};
+    utf16_to_utf8(utf16_name, utf8_name);
+    
+    memcpy(entry->file_name, utf8_name, strlen(utf8_name));
     entry->size = (len + 1) * 32;
 }
 
-DirEntry parse_dir_entry(uint8_t* buffer)
+MyDirEntry parse_dir_entry(uint8_t* buffer)
 {
-    DirEntry entry = {
-        .file_name = {0}
-    };
+
+    MyDirEntry e;
     
     uint8_t attr = buffer[11];
     if (attr == 0x0f)
     {
-        parse_lfns(buffer, &entry);
-        step_buffer(&buffer, entry.size - 32);
-        // since there is lfn, standard8.3 file name can be ignored
-        step_buffer(&buffer, 11);
+        parse_lfn(buffer, &e);
+        step_buffer(&buffer, e.size - 32);
     }
-    else
-    {
-        // standard8.3, parse file name
-        int j = 0;
-        for (int i = 0; i < 11; i++)
-        {
-            uint8_t c = buffer[0];
-            // ignore spaces
-            if (c != 0x20)
-            {
-                entry.file_name[j] = c;
-                j += 1;
-            }
-            step_buffer(&buffer, 1);
-        }    
-    }
+
+    DirEntry entry;
+    memcpy(&entry, buffer, sizeof(entry));
+
+    e.cluster_num = (entry.high_cluster_num << 16) + entry.low_cluster_num;
+    e.file_size = entry.file_size;
+    e.attr = entry.attr;
     
-    entry.attr = buffer[0];
-    // ignore create time for now
-    buffer += 9;
-
-    int high = little_endian_to_int(buffer, 2);
-    buffer += 6;
-
-    int low = little_endian_to_int(buffer, 2);
-    buffer += 2;
-
-    int cluster_num = (high << 16) + low;
-    entry.cluster_num = cluster_num;
-    entry.file_size = little_endian_to_int(buffer, 4);
-    buffer += 4;
-    return entry;
+    return e;
 }
 
-DirEntryList* parse_dir_entries(uint8_t* buffer, DirEntry parent)
+DirEntryList* parse_dir_entries(uint8_t* buffer)
 {
     // flexible array member
-    DirEntryList* es = malloc(sizeof(DirEntryList) + 100 * sizeof(DirEntry));
+    DirEntryList* es = malloc(sizeof(DirEntryList) + 100 * sizeof(MyDirEntry));
     while (!entry_end(buffer))
     {
-        DirEntry entry = parse_dir_entry(buffer);
+        MyDirEntry entry = parse_dir_entry(buffer);
         showDirEntry(entry);
         step_buffer(&buffer, entry.size);
         
@@ -342,13 +283,13 @@ DirEntryList* parse_dir_entries(uint8_t* buffer, DirEntry parent)
     return es;
 }
 
-void walk_fs(DirEntry entry)
+void walk_fs(MyDirEntry entry)
 {
     uint8_t* offset = DATA_OFFSET(entry.cluster_num);
-    DirEntryList* es =  parse_dir_entries(offset, entry);
+    DirEntryList* es =  parse_dir_entries(offset);
     for (int i = 0; i < es->size; i++)
     {
-        DirEntry e = es->entries[i];
+        MyDirEntry e = es->entries[i];
         if (IS_DIR(e))
         {
             if (strcmp(e.file_name, ".") == 0 || strcmp(e.file_name, "..") == 0)
@@ -380,17 +321,11 @@ FAT* parse_fat(uint8_t* buffer)
 {
     // FAT is index of clusters, it's an array structure, every index is 4 bytes wide
     // index 0 and 1 are reserved, so root entry starts at index(cluster) 2
-    int len = (bpb.num_of_fat * bpb.sectors_per_fat * bpb.num_of_bytes_per_sector) / 4;
-    FAT* fat = malloc(sizeof(FAT) + len * sizeof(int));
-    fat->size = 0;
-
-    int v;
-    while (v = little_endian_to_int(buffer, 4), v != 0)
-    {
-        fat->cluster_info[fat->size] = v;
-        fat->size += 1;
-        buffer += 4;
-    }
+    int len = (bpb.num_of_fat * ebr.sectors_per_fat * bpb.num_of_bytes_per_sector) / 4;
+    FAT* fat = malloc(sizeof(FAT) + len * sizeof(uint32_t));
+    fat->size = len;
+    memcpy(fat->cluster_info, buffer, bpb.num_of_fat * ebr.sectors_per_fat * bpb.num_of_bytes_per_sector);
+    
     return fat;
 }
 
@@ -417,6 +352,7 @@ int main()
     }
     
     bpb = parse_bpb(file_begin);
+    ebr = parse_extend_boot_record(&file_begin[0] + 36);
 
     int i = bpb.num_of_reserved_sectors * bpb.num_of_bytes_per_sector;
     fat_offset = &file_begin[i];
@@ -425,11 +361,11 @@ int main()
     printf("fat_size: %d\n", fat->size);
 
     // jump to directory entry
-    int j = bpb.sectors_per_fat * bpb.num_of_fat * bpb.num_of_bytes_per_sector + i;
+    int j = ebr.sectors_per_fat * bpb.num_of_fat * bpb.num_of_bytes_per_sector + i;
     dir_offset = &file_begin[j];
     printf("dir_offset: %x\n", j);
 
-    DirEntry root;
+    MyDirEntry root;
     root.cluster_num = 2;
     showDirEntry(root);
     walk_fs(root);
