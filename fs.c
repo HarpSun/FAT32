@@ -17,6 +17,13 @@ Flexible Array Member: https://en.wikipedia.org/wiki/Flexible_array_member
 #include <stdlib.h>
 #include <uchar.h>
 #include <locale.h>
+#include <time.h>
+
+#define _FILE_OFFSET_BITS 64
+#define FUSE_USE_VERSION 32
+#define _GNU_SOURCE
+
+#include <fuse.h>
 
 
 /*
@@ -42,6 +49,18 @@ typedef struct __attribute__((packed)) {
 
 typedef struct __attribute__((packed)) {
     uint32_t sectors_per_fat;
+    uint16_t flags;
+    uint16_t fat_version;
+    uint32_t root_cluster_num;
+    uint16_t fs_info_sector_num;
+    uint16_t backup_boot_sector_num;
+    uint8_t reserved[12];
+    uint8_t drive_number;
+    uint8_t win_nt_flags;
+    uint8_t signature;
+    uint32_t volume_serial_num;
+    char volume_label_str[11];
+    char system_ident[8];
 } ExtendBootRecord;
 
 typedef struct __attribute__((packed)) {
@@ -57,7 +76,7 @@ typedef struct __attribute__((packed)) {
 
 // standard 8.3 format
 typedef struct __attribute__((packed)) {
-    uint8_t file_name[11];
+    char file_name[11];
     uint8_t attr;
     uint8_t reserved;
     uint8_t creation_time_millisecond;
@@ -69,19 +88,14 @@ typedef struct __attribute__((packed)) {
     uint16_t last_modify_date;
     uint16_t low_cluster_num;
     uint32_t file_size;
+    uint8_t* buffer;
+    uint8_t lfn_size;
+    LFN lfns[];
 } DirEntry;
 
 typedef struct {
-    char file_name[512];
-    int cluster_num;
-    int file_size;
     int size;
-    uint8_t attr;
-} MyDirEntry;
-
-typedef struct {
-    int size;
-    MyDirEntry entries[];
+    DirEntry* entries[];
 } DirEntryList;
 
 typedef struct {
@@ -89,12 +103,22 @@ typedef struct {
     uint32_t cluster_info[];
 } FAT;
 
+typedef struct {
+    uint8_t* data;
+    uint8_t* begin;
+    uint32_t cluster_num;
+    int disk_offset;
+} DiskBuffer;
 
+typedef struct {
+    DiskBuffer* bf1;
+    DiskBuffer* bf2;
+} DoubleBuffer;
+
+static int fd;
 // anchor point
 // easy to make navigation through file buffer
-static uint8_t* file_begin;
-static uint8_t* fat_offset;
-static uint8_t* dir_offset;
+static int data_offset;
 // bpb contain fs meta data, fat is index of data
 // should be easily access by any function
 static BPB bpb;
@@ -102,6 +126,7 @@ static ExtendBootRecord ebr;
 static FAT* fat;
 
 
+#define DISK_CACHE_SIZE 512 * 128  // 128 secotrs, 64k
 #define CLUSTER_END 0x0ffffff8
 #define CLUSTER_BAD 0x0ffffff7
 #define LFN_END_MASK 0x40
@@ -111,7 +136,7 @@ static FAT* fat;
 #define DATA_OFFSET(cluster_num) \
     dir_offset + ((cluster_num) - 2) * bpb.num_of_sectors_per_cluster * bpb.num_of_bytes_per_sector
 
-#define IS_DIR(entry) (entry).attr == 0x10
+#define IS_DIR(entry) (entry)->attr == 0x10
     
     
 void showBPB(BPB bpb)
@@ -127,12 +152,26 @@ void showBPB(BPB bpb)
     printf("num_of_fat: %d\n", bpb.num_of_fat);
 }
 
-void showDirEntry(MyDirEntry entry)
+void showDirEntry(DirEntry* entry)
 {
     printf("--------------- DirEntry ---------------\n");
-    printf("file_name: %s\n", entry.file_name);
-    printf("file_size: %d\n", entry.file_size);
-    printf("cluster_num: %d\n", entry.cluster_num);
+    printf("file_name: %s\n", entry->file_name);
+    printf("file_size: %d\n", entry->file_size);
+    printf("cluster_num: %d\n", (entry->high_cluster_num << 16) + entry->low_cluster_num);
+}
+
+void showDiskBuffer(DiskBuffer* buffer)
+{
+    printf("--------------- DiskBUffer ---------------\n");
+    printf("cluster_num: %d\n", buffer->cluster_num);
+    printf("disk_offset: %x\n", buffer->disk_offset);
+    printf("data: %p\n", buffer->data);
+    printf("begin: %p\n", buffer->begin);
+    for (int i = 0; i < 64; i++)
+    {
+        printf("%x ", buffer->data[i]);
+    }
+    printf("\n");
 }
 
 
@@ -140,7 +179,22 @@ void showDirEntry(MyDirEntry entry)
 //
 //                utils
 //
-bool entry_end(uint8_t* buffer)
+void strip_whitespace(char* str, char* res, int len)
+{
+    int end = 0;
+    for (int i = len - 1; i >= 0; i--)
+    {
+        if (str[i] != 0x20)
+        {
+            end = i;
+            break;
+        }
+    }
+    memcpy(res, str, end + 1);
+}
+
+    
+static inline bool entry_end(uint8_t* buffer)
 {
     return buffer[0] == 0;
 }
@@ -163,33 +217,109 @@ void utf16_to_utf8(char16_t* str, char* res)
     }
 }
 
-// auto jump to next cluster, if step would across current cluster
-int step_buffer(uint8_t** buffer, size_t n)
+// path parser
+void path_split(char* path, char* current_path, char* left_path)
+{
+    if (path[0] == '/')
+    {
+        path = path + 1;
+    }
+    
+    int i = 0;
+    while (path[i] != '/' && i < strlen(path))
+    {
+        i++;
+    }
+
+    memcpy(current_path, path, i);
+    memcpy(left_path, path + 1, strlen(path) - i);
+}
+
+int min(int a, int b)
+{
+    return a > b ? b : a;
+}
+
+
+//////////////////////////////////////////////////
+//
+//                disk buffer
+//
+DiskBuffer* buffer_init(uint32_t cluster_num)
+{
+    printf("[buffer_init] %d\n", cluster_num);
+    DiskBuffer* buffer = malloc(sizeof(DiskBuffer));
+    int offset = data_offset + ((cluster_num) - 2) * bpb.num_of_sectors_per_cluster * bpb.num_of_bytes_per_sector;
+    lseek(fd, offset, SEEK_SET);
+    buffer->begin = malloc(sizeof(uint8_t) * DISK_CACHE_SIZE);
+    buffer->data = buffer->begin;
+    buffer->disk_offset = offset;
+    buffer->cluster_num = cluster_num;
+    read(fd, buffer->data, DISK_CACHE_SIZE);
+    return buffer;
+}
+
+void buffer_jump(DiskBuffer* buffer, uint32_t next_cluster)
+{
+    int bytes_per_cluster = bpb.num_of_bytes_per_sector * bpb.num_of_sectors_per_cluster;    
+    int cache_clusters = DISK_CACHE_SIZE / bytes_per_cluster;
+    // disk buffer contain target cluster, no need read new data from disk
+    if (next_cluster > buffer->cluster_num &&
+        next_cluster < buffer->cluster_num + cache_clusters)
+    {
+        printf("[cross cluster but no read disk]\n");
+        buffer->data = buffer->begin + (next_cluster - buffer->cluster_num) * bytes_per_cluster;
+    }
+    else
+    // disk buffer doesn't contain, read from disk
+    {
+        printf("[read disk]\n");
+        int offset = data_offset + (next_cluster - 2) * bpb.num_of_sectors_per_cluster * bpb.num_of_bytes_per_sector;
+        
+        lseek(fd, offset, SEEK_SET);
+        read(fd, buffer->begin, DISK_CACHE_SIZE);
+        buffer->data = buffer->begin;
+        buffer->disk_offset = offset;
+        buffer->cluster_num = next_cluster;
+    }
+}
+
+int buffer_step(DiskBuffer* buffer, size_t n)
 {
     int bytes_per_cluster = bpb.num_of_bytes_per_sector * bpb.num_of_sectors_per_cluster;
-    int pos = (*buffer - dir_offset) % bytes_per_cluster;
+    int pos = (buffer->data - buffer->begin) % bytes_per_cluster;
     if (pos + n < bytes_per_cluster)
     {
-        *buffer += n;
+        printf("[no cross cluster]\n");
+        buffer->data += n;
         return 0;
     }
     else
     {
-        int cluster_num = (*buffer - dir_offset) / bytes_per_cluster + 2;
-        int v = fat->cluster_info[cluster_num];
-        if (v < CLUSTER_END && v != CLUSTER_BAD)
+        int cluster_num = (buffer->data - buffer->begin) / bytes_per_cluster + buffer->cluster_num;
+        int next_cluster = fat->cluster_info[cluster_num];
+        if (next_cluster >= CLUSTER_END || next_cluster == CLUSTER_BAD)
         {
-            *buffer = DATA_OFFSET(v);
-            *buffer += n - (bytes_per_cluster - pos);
-            return 0;
-        }
-        else
-        {
-            // printf("buffer_end");
+            printf("[cluster_end]\n");
             return -1;
         }
+         
+        buffer_jump(buffer, next_cluster);
+        buffer->data += n - (bytes_per_cluster - pos);
+        return 0;
+        
     }
 }
+
+// sync buffer to disk by writing buffer
+void buffer_sync(DiskBuffer* buffer)
+{
+    printf("[buffer_sync]\n");
+    lseek(fd, buffer->disk_offset, SEEK_SET);
+    write(fd, buffer->begin, DISK_CACHE_SIZE);
+}
+
+
 
 //////////////////////////////////////////////////
 //
@@ -199,7 +329,6 @@ BPB parse_bpb(uint8_t* buffer)
 {
     BPB bpb;
     memcpy(&bpb, buffer, sizeof(bpb));
-    showBPB(bpb);
     return bpb;
 }
 
@@ -210,26 +339,14 @@ ExtendBootRecord parse_extend_boot_record(uint8_t* buffer)
     return ebr;
 }
 
-void parse_lfn(uint8_t* buffer, MyDirEntry* entry)
+void parse_lfn(LFN lfns[], char* name)
 {
-    LFN lfn_array[20];
-    int len = 0;
-    
-    uint8_t lfn_number;
-    do {
-        LFN lfn;
-        memcpy(&lfn, buffer, sizeof(lfn));
-        lfn_number = lfn.order & LFN_NUM_MASK;
-        lfn_array[lfn_number - 1] = lfn;
-        len += 1;
-        buffer += 32;
-    } while (lfn_number > 1);
-
     char16_t utf16_name[256];
     char16_t* offset = &utf16_name[0];
-    for (int i = 0; i < len; i++)
+    int size = lfns[0].order & LFN_NUM_MASK;
+    for (int i = size - 1; i >= 0; i--)
     {
-        LFN lfn = lfn_array[i];
+        LFN lfn = lfns[i];
         memcpy(offset, lfn.name1, 10);
         offset += 5;
         memcpy(offset, lfn.name2, 12);
@@ -238,78 +355,115 @@ void parse_lfn(uint8_t* buffer, MyDirEntry* entry)
         offset += 2;
     }
     
-    char utf8_name[512] = {0};
-    utf16_to_utf8(utf16_name, utf8_name);
-    
-    memcpy(entry->file_name, utf8_name, strlen(utf8_name));
-    entry->size = (len + 1) * 32;
+    // char utf8_name[512] = {0};
+    utf16_to_utf8(utf16_name, name);
 }
 
-MyDirEntry parse_dir_entry(uint8_t* buffer)
+DirEntry* parse_dir_entry2(DiskBuffer* db)
 {
-
-    MyDirEntry e;
-    
-    uint8_t attr = buffer[11];
+    uint8_t attr = db->data[11];
+    int lfn_size = 0;
     if (attr == 0x0f)
     {
-        parse_lfn(buffer, &e);
-        step_buffer(&buffer, e.size - 32);
+        // lfns are reversed placed, so its first order byte can indicate num of lfn entry
+        lfn_size = db->data[0] & LFN_NUM_MASK;
     }
 
-    DirEntry entry;
-    memcpy(&entry, buffer, sizeof(entry));
+    printf("lfn_size: %d\n", lfn_size);
+    DirEntry* entry = malloc(sizeof(DirEntry) + lfn_size * sizeof(LFN));
+    entry->buffer = NULL;
+    int i = 1;
+    while (attr == 0x0f)
+    {
+        memcpy((void*)entry + 32 * i + 9, db->data, sizeof(LFN));
+        buffer_step(db, 32);
+        attr = db->data[11];
+        i++;
+    }
+    entry->lfn_size = lfn_size;
+    // decrease size of lfn_size and buffer which is not part of Standard DirEntry
+    memcpy(entry, db->data, sizeof(DirEntry) - 9);
+    buffer_step(db, 32);
 
-    e.cluster_num = (entry.high_cluster_num << 16) + entry.low_cluster_num;
-    e.file_size = entry.file_size;
-    e.attr = entry.attr;
-    
-    return e;
+    return entry;
 }
 
-DirEntryList* parse_dir_entries(uint8_t* buffer)
+DirEntryList* parse_dir_entries2(DiskBuffer* db)
 {
     // flexible array member
-    DirEntryList* es = malloc(sizeof(DirEntryList) + 100 * sizeof(MyDirEntry));
-    while (!entry_end(buffer))
+    int size = sizeof(DirEntryList) + 100 * sizeof(DirEntry*);
+    DirEntryList* es = malloc(size);
+    memset(es, 0, size);
+    while (!entry_end(db->data))
     {
-        MyDirEntry entry = parse_dir_entry(buffer);
-        showDirEntry(entry);
-        step_buffer(&buffer, entry.size);
-        
+        printf("[parse_entry start]\n");
+        DirEntry* entry = parse_dir_entry2(db);
         es->entries[es->size] = entry;
         es->size += 1;
+        showDirEntry(entry);
     }
     return es;
 }
 
-void walk_fs(MyDirEntry entry)
+void parse_file_name(DirEntry* entry, char* file_name)
 {
-    uint8_t* offset = DATA_OFFSET(entry.cluster_num);
-    DirEntryList* es =  parse_dir_entries(offset);
+    if (entry->lfn_size > 0)
+    {
+        parse_lfn(entry->lfns, file_name);
+    }
+    else
+    {
+        strip_whitespace(entry->file_name, file_name, 11);
+    }
+}
+
+time_t parse_file_date(DirEntry* entry)
+{
+    struct tm tm;
+    // tm year starts from 1900, fat32 year starts from 1980
+    tm.tm_year = ((entry->last_modify_date & 0b1111111000000000) >> 9) + 80;
+    tm.tm_mon = ((entry->last_modify_date & 0b0000000111100000) >> 5) - 1;
+    tm.tm_mday  = entry->last_modify_date & 0b0000000000011111;
+    // utc to zh/shanghai time
+    tm.tm_hour  = ((entry->last_modify_time & 0b1111100000000000) >> 11) + 8;
+    tm.tm_min   = (entry->last_modify_time & 0b0000011111100000) >> 5;
+    tm.tm_sec   = entry->last_modify_time & 0b0000000000011111;
+    tm.tm_isdst = -1;
+    return mktime(&tm);
+    // printf("%b, %b, %d\n", entry->last_modify_date, entry->created_time, entry->creation_time_millisecond);
+}
+
+void walk_fs(DiskBuffer* db)
+{
+    DirEntryList* es =  parse_dir_entries2(db);
     for (int i = 0; i < es->size; i++)
     {
-        MyDirEntry e = es->entries[i];
+        DirEntry* e = es->entries[i];
+        uint32_t n = (e->high_cluster_num << 16) + e->low_cluster_num;
+        
         if (IS_DIR(e))
         {
-            if (strcmp(e.file_name, ".") == 0 || strcmp(e.file_name, "..") == 0)
+            char file_name[12];
+            strip_whitespace(e->file_name, file_name, 11);
+            if (strcmp(file_name, ".") == 0 || strcmp(file_name, "..") == 0)
             {
                 continue;
             }
             // printf("[folder_data_offset] %x %d\n", (int)dir_offset + DATA_OFFSET(e, bpb), e.cluster_num);
-            walk_fs(e);
+            buffer_jump(db, n);
+            walk_fs(db);
         }
         else
         {
             // printf("[data_offset] %p %d\n", DATA_OFFSET(e.cluster_num), e.cluster_num);
-            char content[e.file_size + 512];
-            uint8_t* offset = DATA_OFFSET(e.cluster_num);
-            memcpy(content, offset, bpb.num_of_bytes_per_sector);
+            char content[e->file_size + 512];
+            buffer_jump(db, n);
+            memcpy(content, db->data, bpb.num_of_bytes_per_sector);
             int i = 0;
-            while (step_buffer(&offset, bpb.num_of_bytes_per_sector) != -1)
+            while (buffer_step(db, bpb.num_of_bytes_per_sector) != -1)
             {
                 char* dst = &content[0] + (i + 1) * bpb.num_of_bytes_per_sector;
-                memcpy(dst, offset, bpb.num_of_bytes_per_sector);
+                memcpy(dst, db->data, bpb.num_of_bytes_per_sector);
                 i += 1;
             }
             printf("content: %s\n", content);
@@ -329,60 +483,273 @@ FAT* parse_fat(uint8_t* buffer)
     return fat;
 }
 
+//////////////////////////////////////////////////
+//
+//                fuse fat32 driver 
+//
+DirEntry* find_entry(char* path, DiskBuffer* buffer)
+{
+    char current_path[256] = {0};
+    char left_path[1024] = {0};
+    path_split(path, current_path, left_path);
+    
+    DirEntryList* es =  parse_dir_entries2(buffer);
+    for (int i = 0; i < es->size; i++)
+    {
+        DirEntry* e = es->entries[i];
+        char file_name[1024] = {0};
+        parse_file_name(e, file_name);
+        if (strcmp(file_name, current_path) == 0)
+        {
+            if (strcmp(left_path, "") == 0 || strcmp(left_path, "/") == 0)
+            {
+                return e;
+            }
+            else
+            {
+                uint32_t n = (e->high_cluster_num << 16) + e->low_cluster_num;
+                buffer_jump(buffer, n);
+                return find_entry(left_path, buffer);
+            }
+        }
+    }
+    return NULL;
+}
 
-int main()
+
+// /dir1/dir2  dir1/dir2 dir2
+void readdir(char* path, DiskBuffer* db, fuse_fill_dir_t addEntry, void* buffer)
+{
+    // printf("path: %s %p\n", path, entry_buffer);
+    DirEntryList* es;
+    
+    if (strcmp(path, "") == 0 || strcmp(path, "/") == 0)
+    {
+        es = parse_dir_entries2(db);
+    }
+    else
+    {
+        DirEntry* e = find_entry(path, db);
+        uint32_t n = (e->high_cluster_num << 16) + e->low_cluster_num;
+        buffer_jump(db, n);
+        es =  parse_dir_entries2(db);
+    }
+
+    for (int i = 0; i < es->size; i++)
+        {
+            DirEntry* e = es->entries[i];
+            if (e->file_name[0] != 0xe5)
+            {
+                char file_name[1024] = {0};
+                parse_file_name(e, file_name);
+                addEntry(buffer, file_name, NULL, 0);
+            }
+        }
+}
+
+int callback_readdir(const char *path, void *buffer, fuse_fill_dir_t addEntry, off_t offset, struct fuse_file_info *fileInfo)
+{
+    printf("[readdir] %s\n", path);
+    readdir((char*)path, buffer_init(ebr.root_cluster_num), addEntry, buffer);
+    return 0;
+}
+
+// TODO: add cache for entry
+int getattr(char* path, DiskBuffer* db, struct stat* stat)
+{
+    DirEntry* e = find_entry(path, db);
+    if (e == NULL)
+    {
+        return -ENOENT;
+    }
+    else
+    {
+        if (IS_DIR(e))
+        {
+            stat->st_mode = S_IFDIR | 0644;
+        }
+        else
+        {
+            stat->st_mode = S_IFREG | 0644;
+        }
+        struct timespec t = {.tv_sec = parse_file_date(e)};
+        stat->st_mtim = t;
+        stat->st_size = e->file_size;
+        return 0;
+    }
+}
+
+int callback_getattr(const char *path, struct stat *stat)
+{
+    printf("[getattr] %s\n", path);
+    if (strcmp(path, "/") == 0)
+    {
+        stat->st_mode = S_IFDIR | 0755;
+        return 0;
+    }
+    else
+    {
+        return getattr((char*)path, buffer_init(ebr.root_cluster_num), stat);
+    }
+}
+
+int read_content(char* path, DiskBuffer* db, char* buffer, size_t size, off_t offset)
+{
+    DirEntry* e = find_entry(path, db);
+    if (e == NULL)
+    {
+        return 0;
+    }
+    else
+    {
+        uint32_t n = (e->high_cluster_num << 16) + e->low_cluster_num;
+        buffer_jump(db, n);
+        // uint8_t* content = DATA_OFFSET(n);
+        buffer_step(db, offset);
+        int s = min(e->file_size - offset, size);
+        memcpy(buffer, db->data, s);
+        return s;
+    }
+}
+
+int callback_read(const char *path, char *buffer, size_t size, off_t offset, struct fuse_file_info *fileInfo)
+{
+    printf("[read] %s %ld %ld\n", path, size, offset);
+    return read_content((char*)path, buffer_init(ebr.root_cluster_num), buffer, size, offset);
+}
+
+// void unlink(DiskBuffer* db, const char* path)
+// {
+//     while (!entry_end(db->data))
+//     {
+//         printf("[parse_entry start]\n");
+//         DirEntry* entry = parse_dir_entry2(db);
+//         if (strcmp(parse_file_name(entry), path) == 0)
+//         {
+//             // 0xe5 for deleted
+//             while (buffer[11] == 0x0f)
+//             {
+//                 buffer[0] = 0xe5;
+//                 buffer_step(db, 32);
+//             }
+//             buffer[0] = 0xe5;
+
+//             // clear fat
+//             uint32_t prev = (e->high_cluster_num << 16) + e->low_cluster_num;
+//             int next = fat->cluster_info[prev];
+//             fat->cluster_info[prev] = 0;
+//             printf("cluster[%d] = 0\n", prev);
+//             while (next < CLUSTER_END && next != CLUSTER_BAD)
+//             {
+//                 prev = next;
+//                 next = fat->cluster_info[next];
+//                 fat->cluster_info[prev] = 0;
+//                 printf("cluster[%d] = 0\n", prev);
+//             }    
+//         }
+        
+//     }
+//     return es;
+// }
+
+int callback_unlink(const char* path)
+{
+    printf("[unlink] %s\n", path);
+    DiskBuffer* db = buffer_init(ebr.root_cluster_num);
+    DirEntry* e = find_entry((char*)path, db);
+    if (e == NULL)
+    {
+        return 0;
+    }
+    else
+    {
+        // 0xe5 for deleted
+        uint8_t* buffer = e->buffer;
+        while (buffer[11] == 0x0f)
+        {
+            buffer[0] = 0xe5;
+            buffer_step(db, 32);
+        }
+        buffer[0] = 0xe5;
+
+        // clear fat
+        uint32_t prev = (e->high_cluster_num << 16) + e->low_cluster_num;
+        int next = fat->cluster_info[prev];
+        fat->cluster_info[prev] = 0;
+        printf("cluster[%d] = 0\n", prev);
+        while (next < CLUSTER_END && next != CLUSTER_BAD)
+        {
+            prev = next;
+            next = fat->cluster_info[next];
+            fat->cluster_info[prev] = 0;
+            printf("cluster[%d] = 0\n", prev);
+        }
+        buffer_sync(db);
+        return 0;
+    }
+}
+
+int main(int argc, char *argv[])
 {
     setlocale(LC_ALL, "en_US.UTF-8");
     
     // printf("hello fs\n");
-    int fd = open("disk.img", O_RDWR);
+    fd = open("disk.img", O_RDWR);
     if (fd == -1)
     {
         printf("open failed! %s\n", strerror(errno));
         return -1;
     }
 
-    const int size = 1024 * 1000 * 1000;
-    file_begin = malloc(sizeof(uint8_t) * size);
-    int res = read(fd, file_begin, size);
+    const int size = 512;
+    uint8_t* buffer = malloc(sizeof(uint8_t) * size);
+    int res = read(fd, buffer, size);
     if (res == -1)
     {
         printf("read failed! %s\n", strerror(errno));
         return -1;
     }
     
-    bpb = parse_bpb(file_begin);
-    ebr = parse_extend_boot_record(&file_begin[0] + 36);
+    bpb = parse_bpb(buffer);
+    ebr = parse_extend_boot_record(buffer + 36);
 
-    int i = bpb.num_of_reserved_sectors * bpb.num_of_bytes_per_sector;
-    fat_offset = &file_begin[i];
-    printf("fat_offset: %x\n", i);
-    fat = parse_fat(fat_offset);
+    int fat_offset = bpb.num_of_reserved_sectors * bpb.num_of_bytes_per_sector;
+    const int fat_size = bpb.num_of_fat * ebr.sectors_per_fat * bpb.num_of_bytes_per_sector;
+    uint8_t* buffer2 = malloc(sizeof(uint8_t) * fat_size);
+    lseek(fd, fat_offset, SEEK_SET);
+    read(fd, buffer2, fat_size);
+    
+    fat = parse_fat(buffer2);
+    free(buffer);
+    free(buffer2);
+    
+    showBPB(bpb);
     printf("fat_size: %d\n", fat->size);
+    
 
     // jump to directory entry
-    int j = ebr.sectors_per_fat * bpb.num_of_fat * bpb.num_of_bytes_per_sector + i;
-    dir_offset = &file_begin[j];
-    printf("dir_offset: %x\n", j);
+    data_offset = fat_offset + ebr.sectors_per_fat * bpb.num_of_fat * bpb.num_of_bytes_per_sector;
+    printf("dir_offset: %x\n", data_offset);
 
-    MyDirEntry root;
-    root.cluster_num = 2;
-    showDirEntry(root);
-    walk_fs(root);
-
-    // write file content
-    // char data2[] = "123456789";
-    // lseek(fd, dir_offset + data_offset, SEEK_SET);
-    // res = write(fd, data2, sizeof(data2));
-    // if (res == -1)
+    // DiskBuffer* db = buffer_init(3);
+    // for (int i = 0; i < 512 / 32 - 1; i++)
     // {
-    //     printf("write failed! %s\n", strerror(errno));        
+    //     showDiskBuffer(db);
+    //     buffer_step(db, 32);
     // }
 
-    // // write file size
-    // lseek(fd, dir_offset + 60, SEEK_SET);
-    // uint8_t size[] = {10, 0, 0, 0};
-    // res = write(fd, size, sizeof(size));
+    // DiskBuffer* db = buffer_init(ebr.root_cluster_num);
+    // walk_fs(db);
+
+    // fuse
+    static struct fuse_operations operations = {
+        .getattr    = callback_getattr,
+        .readdir    = callback_readdir,
+        .read       = callback_read,
+        // .rename     = callback_rename,
+        // .unlink     = callback_unlink,
+    };
+    return fuse_main(argc, argv, &operations, NULL);
 }
 
 
