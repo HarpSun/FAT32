@@ -22,6 +22,7 @@ def make_large_dir():
     num_of_files = 12
     for i in range(num_of_files):
         os.system(f"echo '{i}abc' > vdisk/{i}.txt")
+    os.system("umount vdisk")
 
 
 def make_large_file():
